@@ -21,6 +21,7 @@ WORKDIR /app
 COPY entrypoint.sh /app/entrypoint.sh
 COPY exporter.py   /app/exporter.py
 COPY config.json.tmpl /app/config.json.tmpl
+COPY tesla-prod-ca.crt /etc/tesla/prod_ca.crt
 RUN chmod +x /app/entrypoint.sh
 
 ENV TELEM_HOST=0.0.0.0 \
@@ -28,7 +29,8 @@ ENV TELEM_HOST=0.0.0.0 \
     PROM_PORT=9200 \
     NAMESPACE=tesla \
     LOG_LEVEL=info \
-    CONFIG_PATH=/app/config.json
+    CONFIG_PATH=/app/config.json \
+    TLS_CLIENT_CA=/etc/tesla/prod_ca.crt
 
 EXPOSE 443/tcp 9200/tcp
 

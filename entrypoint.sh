@@ -23,7 +23,7 @@ sed \
   /app/config.json.tmpl > "$CONFIG_PATH"
 
 echo "=== rendered config $CONFIG_PATH ==="
-sed -E 's|("server_key"|.*"server_cert"|.*)|\1 [REDACTED]|' "$CONFIG_PATH" >&2 || cat "$CONFIG_PATH" >&2
+cat "$CONFIG_PATH" >&2
 
 # Verify cert+key readable
 for f in "$TLS_CERT" "$TLS_KEY" "$TLS_CLIENT_CA"; do

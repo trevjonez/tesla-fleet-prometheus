@@ -30,7 +30,7 @@ Prometheus     ◄──── HTTP /metrics ───────    │   └�
 | `PROM_PORT` | no | `9200` | Bind port for `/metrics` |
 | `TLS_CERT` | **yes** | — | Path inside the container to the server cert (PEM) |
 | `TLS_KEY` | **yes** | — | Path inside the container to the server key (PEM) |
-| `TLS_CLIENT_CA` | **yes** | — | Path inside the container to the CA bundle that validates vehicle (client) certs |
+| `TLS_CLIENT_CA` | no | `/etc/tesla/prod_ca.crt` | Path inside the container to the CA bundle that validates vehicle (client) certs. The image ships with Tesla's production CA bundle (vendored from [teslamotors/fleet-telemetry](https://github.com/teslamotors/fleet-telemetry/blob/main/config/files/prod_ca.crt)). Override only if you need a newer / different bundle. |
 | `NAMESPACE` | no | `tesla` | `namespace` field in the rendered fleet-telemetry config |
 | `LOG_LEVEL` | no | `info` | `info`, `debug`, `warn`, `error` |
 
@@ -73,7 +73,7 @@ docker build -t tesla-fleet-prometheus:dev .
 
 ## Provisioning notes
 
-- **Tesla CA bundle** — needed for `TLS_CLIENT_CA`. Download from Tesla's developer documentation and mount into the container alongside your server cert.
+- **Tesla CA bundle** — included in the image at `/etc/tesla/prod_ca.crt`. Vendored from upstream `teslamotors/fleet-telemetry`. Update the image (or override via env + mount) if Tesla rotates the bundle.
 - **Public server cert** — Tesla's mTLS protocol requires a publicly-trusted server certificate; self-signed certs will not work. Let's Encrypt wildcard or per-host certs are typical.
 - **Cert renewal** — if your server cert is renewed by another tool (e.g. acme.sh, certbot, or a reverse-proxy manager) and the file path you mount stays the same, the supervisor detects the mtime change within ~10 seconds and restarts fleet-telemetry to pick up the new cert. End-to-end downtime is single-digit seconds.
 - **Throughput** — for a single-vehicle homelab, expect single-digit MB of telemetry per day.
