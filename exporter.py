@@ -88,48 +88,49 @@ def _record_value(field: str, vehicle_id: str, value: Any) -> None:
 
 def handle_record(rec: dict) -> None:
     """
-    Translate one fleet-telemetry logger record into Prometheus updates.
+    Translate one fleet-telemetry logrus-JSON record into Prometheus updates.
 
-    Schema reference (fleet-telemetry v0.x):
+    fleet-telemetry with `json_log_enable: true` emits lines like:
       {
-        "topic": "V" | "alerts" | "errors" | "connectivity",
-        "vehicle_id": "<vin>",
-        "data": [
-          {"key": "VehicleSpeed", "value": {"doubleValue": 12.3}},
-          {"key": "BatteryLevel", "value": {"doubleValue": 78.0}},
-          ...
-        ],
-        "created_at": "..."
+        "level": "info",
+        "msg": "record_payload",
+        "time": "...",
+        "vin": "5YJ...",
+        "data": {"BatteryLevel": 79.4, "VehicleSpeed": 23, "Location": {"latitude": .., "longitude": ..}, ...},
+        "metadata": {"txtype": "V", "device_client_version": "1.2.0", ...}
       }
 
-    The actual on-disk format may vary slightly by upstream version; this
-    handler is forgiving — unknown shapes are logged at debug.
+    Other log lines (startup, handshake events, etc.) are also JSON but with
+    different msg fields; we filter to msg=record_payload only.
     """
-    topic = rec.get("topic", "unknown")
-    records_total.labels(topic=topic).inc()
-
-    vehicle_id = rec.get("vehicle_id") or rec.get("vin") or "unknown"
-
-    data = rec.get("data") or rec.get("payload")
-    if not isinstance(data, list):
-        log.debug("record missing data list: %s", rec)
+    # Only translate actual record_payload entries
+    if rec.get("msg") != "record_payload":
         return
 
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        field = entry.get("key") or entry.get("field") or entry.get("name")
-        value_obj = entry.get("value")
-        if field is None or value_obj is None:
-            continue
+    vehicle_id = rec.get("vin") or "unknown"
+    topic = (rec.get("metadata") or {}).get("txtype", "unknown")
+    records_total.labels(topic=topic).inc()
 
-        # value_obj is one of {"doubleValue": x} {"intValue": x} {"stringValue": s} etc.
-        if isinstance(value_obj, dict):
-            for v in value_obj.values():
-                _record_value(field, vehicle_id, v)
-                break
-        else:
-            _record_value(field, vehicle_id, value_obj)
+    data = rec.get("data")
+    if not isinstance(data, dict):
+        # alerts/errors payloads come as lists of dicts; treat each like a sub-record
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, dict):
+                    for k, v in entry.items():
+                        _record_value(k, vehicle_id, v)
+        return
+
+    for field, value in data.items():
+        # Skip metadata-ish fields
+        if field in ("Vin", "CreatedAt", "IsResend", "ConnectionID", "NetworkInterface", "Status", "Name", "Audiences", "StartedAt", "EndedAt"):
+            continue
+        # Nested objects (e.g. Location: {latitude, longitude})
+        if isinstance(value, dict):
+            for sub, sub_v in value.items():
+                _record_value(f"{field}_{sub}", vehicle_id, sub_v)
+            continue
+        _record_value(field, vehicle_id, value)
 
 
 # ---------------------------------------------------------------------------
