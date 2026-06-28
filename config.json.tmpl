@@ -1,0 +1,18 @@
+{
+  "host": "${TELEM_HOST}",
+  "port": ${TELEM_PORT},
+  "status_port": 8080,
+  "log_level": "${LOG_LEVEL}",
+  "namespace": "${NAMESPACE}",
+  "records": {
+    "V": ["logger"],
+    "alerts": ["logger"],
+    "errors": ["logger"],
+    "connectivity": ["logger"]
+  },
+  "tls": {
+    "server_cert": "${TLS_CERT}",
+    "server_key":  "${TLS_KEY}",
+    "ca": "${TLS_CLIENT_CA}"
+  }
+}

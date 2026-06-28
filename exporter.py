@@ -1,0 +1,279 @@
+"""
+Tesla Fleet Telemetry → Prometheus exporter.
+
+Spawns fleet-telemetry as a subprocess, reads its stdout (JSON lines from the
+'logger' dispatcher), and translates each telemetry record into Prometheus
+metrics. Also watches the configured TLS cert + key for mtime changes and
+restarts the subprocess on rotation so the server picks up renewed certs.
+
+Designed to run as the container PID 1 (after entrypoint.sh).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import Any
+
+from prometheus_client import Counter, Gauge, REGISTRY, start_http_server
+
+
+log = logging.getLogger("exporter")
+
+# Lazy gauges/counters keyed by (metric_name, frozenset(labels))
+# We use one Gauge per (field, vehicle_id) effectively, by maintaining a
+# single Gauge per field-name with label `vehicle_id`.
+_gauges: dict[str, Gauge] = {}
+_counters: dict[str, Counter] = {}
+
+records_total = Counter(
+    "tesla_fleet_records_total",
+    "Total number of telemetry records processed from fleet-telemetry stdout",
+    ["topic"],
+)
+parse_errors_total = Counter(
+    "tesla_fleet_parse_errors_total",
+    "Lines from fleet-telemetry that could not be parsed",
+)
+
+
+def _sanitize(name: str) -> str:
+    """Convert Tesla's CamelCase or DotName fields into snake_case Prom names."""
+    out = []
+    for c in name:
+        if c.isupper():
+            out.append("_")
+            out.append(c.lower())
+        elif c == ".":
+            out.append("_")
+        else:
+            out.append(c)
+    s = "".join(out).lstrip("_")
+    # Replace any other non-allowed chars
+    s = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in s)
+    return s
+
+
+def _get_or_create_gauge(field: str) -> Gauge:
+    key = field
+    if key not in _gauges:
+        _gauges[key] = Gauge(
+            f"tesla_{_sanitize(field)}",
+            f"Tesla telemetry field {field}",
+            ["vehicle_id"],
+        )
+    return _gauges[key]
+
+
+def _record_value(field: str, vehicle_id: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        v = 1.0 if value else 0.0
+    elif isinstance(value, (int, float)):
+        v = float(value)
+    else:
+        # Tesla sometimes sends enums as strings; emit a stateset-style 1.0
+        # under a label that encodes the string value.
+        # Keep this simple — skip non-numeric.
+        return
+    _get_or_create_gauge(field).labels(vehicle_id=vehicle_id).set(v)
+
+
+def handle_record(rec: dict) -> None:
+    """
+    Translate one fleet-telemetry logger record into Prometheus updates.
+
+    Schema reference (fleet-telemetry v0.x):
+      {
+        "topic": "V" | "alerts" | "errors" | "connectivity",
+        "vehicle_id": "<vin>",
+        "data": [
+          {"key": "VehicleSpeed", "value": {"doubleValue": 12.3}},
+          {"key": "BatteryLevel", "value": {"doubleValue": 78.0}},
+          ...
+        ],
+        "created_at": "..."
+      }
+
+    The actual on-disk format may vary slightly by upstream version; this
+    handler is forgiving — unknown shapes are logged at debug.
+    """
+    topic = rec.get("topic", "unknown")
+    records_total.labels(topic=topic).inc()
+
+    vehicle_id = rec.get("vehicle_id") or rec.get("vin") or "unknown"
+
+    data = rec.get("data") or rec.get("payload")
+    if not isinstance(data, list):
+        log.debug("record missing data list: %s", rec)
+        return
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        field = entry.get("key") or entry.get("field") or entry.get("name")
+        value_obj = entry.get("value")
+        if field is None or value_obj is None:
+            continue
+
+        # value_obj is one of {"doubleValue": x} {"intValue": x} {"stringValue": s} etc.
+        if isinstance(value_obj, dict):
+            for v in value_obj.values():
+                _record_value(field, vehicle_id, v)
+                break
+        else:
+            _record_value(field, vehicle_id, value_obj)
+
+
+# ---------------------------------------------------------------------------
+# Subprocess supervisor
+
+
+def _watch_certs(paths: list[str], on_change) -> None:
+    """Poll mtimes; invoke on_change when any change is detected."""
+    last = {p: 0.0 for p in paths}
+    for p in paths:
+        try:
+            last[p] = os.path.getmtime(os.path.realpath(p))
+        except FileNotFoundError:
+            log.warning("cert path not present yet: %s", p)
+
+    while True:
+        time.sleep(10)
+        for p in paths:
+            try:
+                m = os.path.getmtime(os.path.realpath(p))
+            except FileNotFoundError:
+                continue
+            if m != last[p]:
+                log.info("cert change detected on %s (mtime %s → %s)", p, last[p], m)
+                last[p] = m
+                on_change()
+                # Don't spam — after one change, sleep extra
+                time.sleep(15)
+
+
+def _load_cert_paths(config_path: str) -> list[str]:
+    with open(config_path) as f:
+        cfg = json.load(f)
+    tls = cfg.get("tls", {}) or {}
+    paths = []
+    for k in ("server_cert", "server_key", "ca"):
+        v = tls.get(k)
+        if v:
+            paths.append(v)
+    return paths
+
+
+def run(config_path: str, prom_port: int) -> int:
+    start_http_server(prom_port)
+    log.info("prometheus /metrics live on :%d", prom_port)
+
+    cert_paths = _load_cert_paths(config_path)
+    log.info("watching for cert mtime changes: %s", cert_paths)
+
+    stop = threading.Event()
+    current_proc: dict[str, subprocess.Popen | None] = {"p": None}
+
+    def start_subprocess() -> subprocess.Popen:
+        log.info("spawning fleet-telemetry with config %s", config_path)
+        return subprocess.Popen(
+            ["/usr/local/bin/fleet-telemetry", "-config", config_path],
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr.fileno(),
+            bufsize=1,
+            text=True,
+        )
+
+    def restart_subprocess() -> None:
+        p = current_proc["p"]
+        if p and p.poll() is None:
+            log.info("sending SIGTERM to fleet-telemetry (pid %d) for cert reload", p.pid)
+            try:
+                p.terminate()
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=5)
+
+    # Start the cert watcher in the background
+    threading.Thread(
+        target=_watch_certs,
+        args=(cert_paths, restart_subprocess),
+        daemon=True,
+    ).start()
+
+    # Forward SIGTERM/SIGINT to the subprocess
+    def _shutdown(signum, frame):
+        log.info("received signal %d, shutting down", signum)
+        stop.set()
+        p = current_proc["p"]
+        if p and p.poll() is None:
+            p.terminate()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    backoff = 1.0
+    while not stop.is_set():
+        proc = start_subprocess()
+        current_proc["p"] = proc
+        backoff = 1.0
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Not a JSON line — fleet-telemetry's own structured logs come through here too
+                    sys.stderr.write(line + "\n")
+                    continue
+                try:
+                    handle_record(rec)
+                except Exception:
+                    parse_errors_total.inc()
+                    log.exception("error handling record")
+        except KeyboardInterrupt:
+            stop.set()
+        finally:
+            rc = proc.wait()
+            log.warning("fleet-telemetry exited rc=%d", rc)
+
+        if stop.is_set():
+            break
+        log.info("respawning fleet-telemetry in %.1fs", backoff)
+        time.sleep(backoff)
+        backoff = min(backoff * 2.0, 30.0)
+
+    log.info("exporter exiting")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, help="Path to fleet-telemetry JSON config")
+    parser.add_argument("--prom-port", type=int, default=9200)
+    parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "info"))
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    return run(args.config, args.prom_port)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
