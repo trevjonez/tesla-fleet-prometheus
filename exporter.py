@@ -235,11 +235,15 @@ def run(config_path: str, prom_port: int) -> int:
                 line = line.rstrip("\n")
                 if not line:
                     continue
+                # Pass everything through to our own stderr so `docker logs`
+                # still shows fleet-telemetry diagnostics (handshake errors,
+                # connection events, etc.). We're consuming the child's
+                # combined stdout+stderr, so without this echo those logs
+                # would be silently eaten.
+                sys.stderr.write(line + "\n")
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    # Not a JSON line — fleet-telemetry's own structured logs come through here too
-                    sys.stderr.write(line + "\n")
                     continue
                 try:
                     handle_record(rec)
