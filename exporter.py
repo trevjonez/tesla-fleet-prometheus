@@ -185,10 +185,12 @@ def run(config_path: str, prom_port: int) -> int:
 
     def start_subprocess() -> subprocess.Popen:
         log.info("spawning fleet-telemetry with config %s", config_path)
+        # fleet-telemetry (logrus) writes to STDERR by default. Merge it
+        # into stdout so we can parse the JSON record stream from one pipe.
         return subprocess.Popen(
             ["/usr/local/bin/fleet-telemetry", "-config", config_path],
             stdout=subprocess.PIPE,
-            stderr=sys.stderr.fileno(),
+            stderr=subprocess.STDOUT,
             bufsize=1,
             text=True,
         )
